@@ -2,6 +2,7 @@ from __future__ import print_function
 import argparse
 import torch
 import sys
+
 sys.path.append('./model')
 sys.path.append('./datasets')
 sys.path.append('./metric')
@@ -97,6 +98,7 @@ def main():
     if not os.path.exists(args.recordfolder):
         os.mkdir(args.recordfolder)
     if args.eval_only:
+        # 评估模式
         solver.test(0)
     else:
         count = 0

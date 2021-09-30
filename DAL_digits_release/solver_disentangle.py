@@ -2,6 +2,7 @@ from __future__ import print_function
 import torch
 import sys
 import os
+
 sys.path.append('./model')
 sys.path.append('./datasets')
 sys.path.append('./metric')
@@ -18,6 +19,7 @@ from utils.utils import _l2_rec, _ent, _discrepancy, _ring
 from torch.utils.tensorboard import SummaryWriter
 from time import gmtime, strftime
 from tqdm import tqdm
+
 
 class Solver():
     def __init__(self, args, batch_size=64, source='svhn',
@@ -86,10 +88,15 @@ class Solver():
             self.G.torch.load('%s/%s_to_%s_model_epoch%s_G.pt' % (
                 self.checkpoint_dir, self.source, self.target, args.resume_epoch))
 
+        # 计算交叉熵损失
         self.xent_loss = nn.CrossEntropyLoss().cuda()
+        # 一般用于单标签分类
         self.adv_loss = nn.BCEWithLogitsLoss().cuda()
+        # 一般用于多标签分类
         self.set_optimizer(which_opt=optimizer, lr=learning_rate)
+        # 使用adam优化算法
         self.to_device()
+        # 设置使用显卡进行计算
 
     def to_device(self):
         for k, v in self.modules.items():
@@ -102,6 +109,7 @@ class Solver():
             self.D[k] = v.cuda()
 
     def set_optimizer(self, which_opt='adam', lr=0.001, momentum=0.9):
+        # adam
         self.opt = {
             'C_ds': optim.Adam(self.C['ds'].parameters(), lr=lr, weight_decay=5e-4),
             'C_di': optim.Adam(self.C['di'].parameters(), lr=lr, weight_decay=5e-4),
@@ -129,13 +137,18 @@ class Solver():
         self.reset_grad()
 
     def optimize_classifier(self, img_src, label_src):
+        # 优化分类器？
         feat_src = self.G(img_src)
+        # 把该参数作为generator（这里是特征提取器）模型的输入？
+        # 目前可能还未训练好该模型，同步进行优化
         _loss = dict()
         for key in ['ds', 'di', 'ci']:
             _loss['class_src_' + key] = self.xent_loss(
                 self.C[key](self.D[key](feat_src)), label_src)
+            # D解耦成2048矩阵，C提取类信息输出10矩阵，最后计算与给定label的交叉熵损失
 
         _sum_loss = sum([l for _, l in _loss.items()])
+        # _是key，l是值
         _sum_loss.backward()
         self.group_opt_step(['G', 'C_ds', 'C_di', 'C_ci', 'D_ds', 'D_di', 'D_ci'])
         return _loss
@@ -163,6 +176,7 @@ class Solver():
 
     def ring_loss_minimizer(self, img_src, img_trg):
         data = torch.cat((img_src, img_trg), 0)
+        # 在第0维度串联2个张量
         feat = self.G(data)
         ring_loss = _ring(feat)
         ring_loss.backward()
@@ -214,6 +228,9 @@ class Solver():
         src_domain_pred = self.FD(self.D['di'](self.G(img_src)))
         tgt_domain_pred = self.FD(self.D['di'](self.G(img_trg)))
         df_loss_src = self.adv_loss(src_domain_pred, self.src_domain_code)
+        # 根据其他demo，第一个参数为predicts，第二个参数为labels
+        # labels用于标注是source还是target
+        # loss越小，FD预测结果越准确，解耦越彻底？
         df_loss_trg = self.adv_loss(tgt_domain_pred, self.trg_domain_code)
         alignment_loss1 = 0.01 * (df_loss_src + df_loss_trg)
         alignment_loss1.backward()
@@ -229,6 +246,7 @@ class Solver():
         self.group_opt_step(['FD', 'D_di', 'G'])
 
         for _ in range(self.num_k):
+            # num_k默认是4
             loss_dis = _discrepancy(
                 self.C['ds'](self.D['ds'](self.G(img_trg))),
                 self.C['di'](self.D['di'](self.G(img_trg))))
@@ -252,8 +270,10 @@ class Solver():
             k = '%s_%s' % (k1, k2)
             rec_src[k] = self.R(torch.cat([feat_src[k1], feat_src[k2]], 1))
             rec_trg[k] = self.R(torch.cat([feat_trg[k1], feat_trg[k2]], 1))
+            # 根据分离特征重构
             rec_loss_src[k] = _l2_rec(rec_src[k], _feat_src)
             rec_loss_trg[k] = _l2_rec(rec_trg[k], _feat_trg)
+            # 与原始特征比较
 
             if recon_loss is None:
                 recon_loss = rec_loss_src[k] + rec_loss_trg[k]
@@ -279,29 +299,40 @@ class Solver():
         pbar_descr_prefix = "Epoch %d" % (epoch)
         with tqdm(total=total_batches, ncols=80, dynamic_ncols=False,
                   desc=pbar_descr_prefix) as pbar:
+            # 进度条
             for batch_idx, data in enumerate(self.datasets):
+                # batch_idx是下标
                 if batch_idx > total_batches:
                     return batch_idx
 
                 img_trg = data['T'].to(self.device)
+                # 放进显卡
                 img_src = data['S'].to(self.device)
                 label_src = data['S_label'].long().to(self.device)
 
                 if img_src.size()[0] < self.batch_size or img_trg.size()[0] < self.batch_size:
+                    # 一轮训练64个
                     break
 
                 self.reset_grad()
                 # ================================== #
                 class_loss = self.optimize_classifier(img_src, label_src)
+                #  优化所有模型
                 ring_loss = self.ring_loss_minimizer(img_src, img_trg)
+                # 优化G
                 self.mutual_information_minimizer(img_src, img_trg)
+                # 优化D MI
                 confusion_loss = self.class_confusion(img_src, img_trg)
+                # 对抗优化D ci与G
                 (alignment_loss1, alignment_loss2, discrepancy_loss) = self.adversarial_alignment(
                     img_src, img_trg)
+                # 优化FD、D di、G ，对抗训练（方法内备注似乎是反的，先协同再对抗），让D可以欺骗FD
                 rec_loss_src, rec_loss_trg = self.optimize_rec(img_src, img_trg)
+                # 优化'D_di', 'D_ci', 'D_ds', 'R'，重构特征
                 # ================================== #
 
                 if batch_idx % self.interval == 0:
+                    # interval=1
                     # ================================== #
                     for key, val in class_loss.items():
                         self.logger.add_scalar(
@@ -342,13 +373,13 @@ class Solver():
                 pbar.update()
         return batch_idx
 
-
     def test(self, epoch, record_file=None, save_model=False):
         self.G.eval()
         self.D['di'].eval()
         self.D['ds'].eval()
         self.C['di'].eval()
         self.C['ds'].eval()
+        # 将这些模型都设为评估模式，约等于self.train（False）
         test_loss = 0
         size = 0
         correct1, correct2, correct3 = 0, 0, 0
@@ -382,11 +413,12 @@ class Solver():
         acc2 = 100. * correct2 / size
         acc3 = 100. * correct3 / size
 
-        print('\nTest set: Average loss: {:.4f}, Accuracy C1: {}/{} ({:.0f}%) Accuracy C2: {}/{} ({:.0f}%) Accuracy Ensemble: {}/{} ({:.0f}%) \n'.format(
-            test_loss,
-            correct1, size, acc1,
-            correct2, size, acc2,
-            correct3, size, acc3))
+        print(
+            '\nTest set: Average loss: {:.4f}, Accuracy C1: {}/{} ({:.0f}%) Accuracy C2: {}/{} ({:.0f}%) Accuracy Ensemble: {}/{} ({:.0f}%) \n'.format(
+                test_loss,
+                correct1, size, acc1,
+                correct2, size, acc2,
+                correct3, size, acc3))
 
         self.logger.add_scalar(
             "test_target_acc/di", acc1,
